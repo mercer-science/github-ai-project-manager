@@ -85,11 +85,14 @@ class Sandbox:
         for k in ("CLAUDE_PROJECT_DIR", "OneDrive", "OneDriveCommercial",
                   "OneDriveConsumer"):
             self.env.pop(k, None)
-        # gh must not be found: a test that reached it would create a real
-        # repository.
-        self.env["PATH"] = os.pathsep.join(
-            p for p in self.env["PATH"].split(os.pathsep)
-            if not os.path.exists(os.path.join(p, "gh")))
+        # A test that reached the real gh would create a real repository,
+        # so a stub that is never logged in comes first on PATH.
+        shim = os.path.join(self.root, "shim")
+        os.makedirs(shim)
+        with open(os.path.join(shim, "gh"), "w", newline="\n") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(shim, "gh"), 0o755)
+        self.env["PATH"] = shim + os.pathsep + self.env["PATH"]
         self.bare = self.path("remote.git")
         self.git("init", "-q", "--bare", "-b", "main", self.bare, cwd=self.root)
 

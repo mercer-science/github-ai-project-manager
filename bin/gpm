@@ -81,8 +81,12 @@ find_python() {
 resolve_root() {
   local at=${1:-.}
   [ -d "$at" ] || die "no such folder: $at"
-  ROOT=$(cd "$at" && git rev-parse --show-toplevel 2>/dev/null) ||
+  local top
+  top=$(cd "$at" && git rev-parse --show-toplevel 2>/dev/null) ||
     die "$(cd "$at" && pwd) is not a git repository. Run \`gpm connect <folder>\` first."
+  # git on Windows answers C:/Users/..., and Git Bash's working directory is
+  # /c/Users/...; going through `cd` gives the form every other path here has.
+  ROOT=$(cd "$top" && pwd)
 }
 
 require_connected() {
@@ -546,7 +550,12 @@ remove_legacy_ignore() {
 # A legacy line the user wants synced: refuse if a file it keeps off is over
 # the limit, since dropping it would put that file in the next push.
 legacy_line_blocked() {  # <pattern>
-  (cd "$ROOT" && git ls-files --others --ignored --exclude="$1" 2>/dev/null) |
+  # Git Bash rewrites an argument that looks like a POSIX path before a
+  # native program sees it, so "--exclude=/data/x" would reach git.exe as a
+  # path under the Git install. Only here: gh needs the project's path
+  # rewritten.
+  (cd "$ROOT" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+    git ls-files --others --ignored --exclude="$1" 2>/dev/null) |
     while IFS= read -r f; do
       [ -n "$(find "$ROOT/$f" -maxdepth 0 -type f -size +"${LIMIT_MB}"M 2>/dev/null)" ] && echo "$f"
     done
