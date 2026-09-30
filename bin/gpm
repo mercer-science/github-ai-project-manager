@@ -97,40 +97,49 @@ require_connected() {
 
 # A path the user typed, as a path relative to $ROOT with no leading "./"
 # and no trailing "/". It need not exist yet. A relative path is taken from
-# the working directory, or from $REL_BASE when set: connect's answers name
-# folders in the project, wherever gpm was run from. Prints nothing and
-# returns 1 for a path outside the project.
+# the working directory, or from the project root when REL_BASE is set:
+# connect's answers name folders in the project, wherever gpm was run from.
+# Prints nothing and returns 1 for a path outside the project.
+#
+# git answers where a folder sits in the project, so no two spellings of one
+# path are ever compared: on Windows the working directory can be /c/Users/
+# RUNNER~1/... while git says C:/Users/runneradmin/..., and both are right.
 rel_path() {
-  local p=$1 abs
+  local p=$1 prefix rest d top want
   case $p in
-    /*) abs=$p ;;
-    [A-Za-z]:[\\/]*) abs=$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p") ;;
-    *) abs=${REL_BASE:-$PWD}/$p ;;
+    /*|[A-Za-z]:[\\/]*)
+      d=$p; rest=
+      while [ ! -d "$d" ]; do
+        rest=$(basename "$d")${rest:+/$rest}
+        d=$(dirname "$d")
+      done
+      top=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || return 1
+      want=$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)
+      [ "$top" = "$want" ] || return 1
+      prefix=$(git -C "$d" rev-parse --show-prefix 2>/dev/null)
+      p=$rest ;;
+    *)
+      if [ -n "${REL_BASE:-}" ]; then
+        prefix=
+      else
+        top=$(git rev-parse --show-toplevel 2>/dev/null) || return 1
+        want=$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)
+        [ "$top" = "$want" ] || return 1
+        prefix=$(git rev-parse --show-prefix 2>/dev/null)
+      fi ;;
   esac
-  abs=$(printf '%s\n' "$abs" | awk -F/ '{
+  printf '%s\n' "$prefix$p" | awk -F/ '{
     n = 0
     for (i = 1; i <= NF; i++) {
       if ($i == "" || $i == ".") continue
-      if ($i == "..") { if (n) n--; continue }
+      if ($i == "..") { if (!n) { bad = 1; break } n--; continue }
       part[++n] = $i
     }
+    if (bad) exit 1
     out = ""
-    for (i = 1; i <= n; i++) out = out "/" part[i]
+    for (i = 1; i <= n; i++) out = out (i > 1 ? "/" : "") part[i]
     print out
-  }')
-  local root
-  root=$(cd "$ROOT" && pwd)
-  case $abs in
-    "$root") echo "" ;;
-    "$root"/*) echo "${abs#"$root"/}" ;;
-    *) # The working directory may reach the root through a symlink.
-       local physical
-       physical=$(cd "$ROOT" && pwd -P)
-       case $abs in
-         "$physical"/*) echo "${abs#"$physical"/}" ;;
-         *) return 1 ;;
-       esac ;;
-  esac
+  }'
 }
 
 # The .gitignore line that names exactly this path.

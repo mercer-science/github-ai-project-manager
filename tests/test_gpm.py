@@ -586,6 +586,13 @@ def test_keep_and_include():
         check("...says the copy on GitHub stays in its history",
               "stays in the repository's history" in r.stdout, r.stdout)
         check("...and records the answer", "/drafts/intro.md" in block(proj))
+        write(proj, "plan/scratch.md", "s\n")
+        r = sb.gpm("keep", "scratch.md", cwd=os.path.join(proj, "plan"))
+        check("a path typed in a subfolder is taken from that subfolder",
+              r.returncode == 0 and "/plan/scratch.md" in block(proj), out(r))
+        r = sb.gpm("keep", "../../elsewhere", cwd=os.path.join(proj, "plan"))
+        check("...and one outside the project is refused",
+              r.returncode == 1 and "not inside the project" in out(r), out(r))
     finally:
         sb.clean()
 
