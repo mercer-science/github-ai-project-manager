@@ -1,0 +1,15 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "github-ai-project-manager-marketplace",
+  "owner": {
+    "name": "Russell Mercer",
+    "email": "rmercer2@byu.edu"
+  },
+  "description": "Keep a project on GitHub from any AI CLI.",
+  "plugins": [
+    {
+      "name": "github-ai-project-manager",
+      "source": "./"
+    }
+  ]
+}

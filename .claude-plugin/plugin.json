@@ -1,0 +1,22 @@
+{
+  "$schema": "https://code.claude.com/schemas/plugin.json",
+  "name": "github-ai-project-manager",
+  "displayName": "GitHub AI Project Manager",
+  "version": "2026.9.30",
+  "description": "Put a project folder on GitHub as a private repository and keep it in step at the start and end of every AI session, in Claude Code, Codex or any other CLI. Nothing is kept off GitHub, or put on it, without the user's answer.",
+  "author": {
+    "name": "Russell Mercer",
+    "email": "rmercer2@byu.edu"
+  },
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "sync",
+    "backup",
+    "git",
+    "codex"
+  ],
+  "skills": [
+    "./skills/github-project"
+  ]
+}

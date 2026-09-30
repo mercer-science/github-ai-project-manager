@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'd=$(git rev-parse --show-toplevel 2>/dev/null) && [ -f \"$d/.gpm/sync.sh\" ] && exec bash \"$d/.gpm/sync.sh\" start; exit 0'",
+            "commandWindows": "if exist \"%ProgramFiles%\\Git\\bin\\bash.exe\" (\"%ProgramFiles%\\Git\\bin\\bash.exe\" .gpm/sync.sh start) else (\"%LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe\" .gpm/sync.sh start)",
+            "timeout": 60
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'd=$(git rev-parse --show-toplevel 2>/dev/null) && [ -f \"$d/.gpm/sync.sh\" ] && exec bash \"$d/.gpm/sync.sh\" report; exit 0'",
+            "commandWindows": "if exist \"%ProgramFiles%\\Git\\bin\\bash.exe\" (\"%ProgramFiles%\\Git\\bin\\bash.exe\" .gpm/sync.sh report) else (\"%LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe\" .gpm/sync.sh report)",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'd=$(git rev-parse --show-toplevel 2>/dev/null) && [ -f \"$d/.gpm/sync.sh\" ] && exec bash \"$d/.gpm/sync.sh\" end; exit 0'",
+            "commandWindows": "if exist \"%ProgramFiles%\\Git\\bin\\bash.exe\" (\"%ProgramFiles%\\Git\\bin\\bash.exe\" .gpm/sync.sh end) else (\"%LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe\" .gpm/sync.sh end)",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,1045 @@
+#!/usr/bin/env bash
+# gpm - keep a project folder on GitHub from any AI CLI.
+#
+# Makes a folder its own private GitHub repository and keeps it in step at
+# the start and end of every AI session: through the CLI's own hooks where it
+# has them (Claude Code, Codex), and by wrapping the CLI (`gpm run`) where it
+# does not. It knows nothing about what the project is.
+#
+# It never creates a public repository unasked, never force-pushes or
+# rewrites pushed history, and never ignores or un-ignores anything the user
+# did not answer for. `gpm help` lists the commands.
+
+set -u
+
+VERSION=2026.9.30
+
+# --- CONTRACT: the markers and strings other files and tests read ---
+BLOCK_BEGIN="# --- github-ai-project-manager: kept on this computer (the user's answers) ---"
+OWN_BEGIN="# --- github-ai-project-manager: its own files, which must reach GitHub ---"
+BLOCK_END="# --- end ---"
+AGENTS_BEGIN="<!-- github-ai-project-manager: sync -->"
+AGENTS_END="<!-- /github-ai-project-manager -->"
+SYNC_PATH=".gpm/sync.sh"
+CLAUDE_FILE=".claude/settings.json"
+CODEX_FILE=".codex/hooks.json"
+# The paper engine's own sync, which `connect` takes over (spec §7).
+LEGACY_SCRIPT=".claude/hooks/sync.sh"
+LEGACY_SCRIPT_MARK="KEPT_NOTE=.git/paper-engine-kept-off"
+LEGACY_SETTINGS=".claude/settings.local.json"
+LEGACY_KEPT_HEADER="# Kept off GitHub by the project sync: too large for a repository."
+LEGACY_RAW_MARKER="*.eer"
+# --- END CONTRACT ---
+
+LIMIT_MB=100          # GitHub refuses a file over this; `include` refuses it too
+ASK_FOLDER_MB=100     # a folder holding this much is asked about at connect
+
+# Where gpm is installed: follow symlinks by hand, since macOS has no
+# `readlink -f`.
+self=${BASH_SOURCE[0]}
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+GPM_HOME=$(cd "$(dirname "$self")/.." && pwd)
+LIB=$GPM_HOME/lib
+ADAPTERS=$GPM_HOME/adapters
+
+die() { echo "gpm: $*" >&2; exit 1; }
+step() { echo "  $*"; }
+problem() { echo "PROBLEM: $*"; PROBLEMS=$((PROBLEMS + 1)); }
+PROBLEMS=0
+
+human() {
+  awk -v b="$1" 'BEGIN {
+    s = b / 1048576; u = "MB"
+    if (s >= 1024) { s /= 1024; u = "GB" }
+    printf "%.1f %s", s, u
+  }'
+}
+
+# A Python that can run lib/hooks_json.py, or nothing. Windows ships a
+# `python` that only opens the Store, so each candidate is tried.
+PYTHON=
+find_python() {
+  [ -n "$PYTHON" ] && return 0
+  local c
+  for c in python3 python py; do
+    if command -v "$c" >/dev/null 2>&1 &&
+       "$c" -c 'import json, sys; sys.exit(0)' >/dev/null 2>&1; then
+      PYTHON=$c
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --- paths --------------------------------------------------------------
+
+# The project root: the given folder, or the repository the working directory
+# is in. Must be the root of its own repository.
+resolve_root() {
+  local at=${1:-.}
+  [ -d "$at" ] || die "no such folder: $at"
+  ROOT=$(cd "$at" && git rev-parse --show-toplevel 2>/dev/null) ||
+    die "$(cd "$at" && pwd) is not a git repository. Run \`gpm connect <folder>\` first."
+}
+
+require_connected() {
+  resolve_root "${1:-.}"
+  [ -f "$ROOT/$SYNC_PATH" ] ||
+    die "$ROOT is not connected (no $SYNC_PATH). Run \`gpm connect \"$ROOT\"\` first."
+}
+
+# A path the user typed, as a path relative to $ROOT with no leading "./"
+# and no trailing "/". It need not exist yet. A relative path is taken from
+# the working directory, or from $REL_BASE when set: connect's answers name
+# folders in the project, wherever gpm was run from. Prints nothing and
+# returns 1 for a path outside the project.
+rel_path() {
+  local p=$1 abs
+  case $p in
+    /*) abs=$p ;;
+    [A-Za-z]:[\\/]*) abs=$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p") ;;
+    *) abs=${REL_BASE:-$PWD}/$p ;;
+  esac
+  abs=$(printf '%s\n' "$abs" | awk -F/ '{
+    n = 0
+    for (i = 1; i <= NF; i++) {
+      if ($i == "" || $i == ".") continue
+      if ($i == "..") { if (n) n--; continue }
+      part[++n] = $i
+    }
+    out = ""
+    for (i = 1; i <= n; i++) out = out "/" part[i]
+    print out
+  }')
+  local root
+  root=$(cd "$ROOT" && pwd)
+  case $abs in
+    "$root") echo "" ;;
+    "$root"/*) echo "${abs#"$root"/}" ;;
+    *) # The working directory may reach the root through a symlink.
+       local physical
+       physical=$(cd "$ROOT" && pwd -P)
+       case $abs in
+         "$physical"/*) echo "${abs#"$physical"/}" ;;
+         *) return 1 ;;
+       esac ;;
+  esac
+}
+
+# The .gitignore line that names exactly this path.
+ignore_line() {
+  local rel=$1 line
+  line=/$(printf '%s' "$rel" | sed 's/[][*?!#\\]/\\&/g')
+  [ -d "$ROOT/$rel" ] && line=$line/
+  printf '%s\n' "$line"
+}
+
+# --- the managed blocks in .gitignore -------------------------------------
+
+block_lines() {  # <begin marker>
+  [ -f "$ROOT/.gitignore" ] || return 0
+  awk -v b="$1" -v e="$BLOCK_END" '
+    $0 == b { on = 1; next }
+    on && $0 == e { on = 0; next }
+    on { print }' "$ROOT/.gitignore"
+}
+
+block_has() { block_lines "$1" | grep -qxF -- "$2"; }
+
+block_add() {  # <begin marker> <line>
+  local gi=$ROOT/.gitignore
+  block_has "$1" "$2" && return 0
+  if [ -f "$gi" ] && grep -qxF -- "$1" "$gi"; then
+    awk -v b="$1" -v e="$BLOCK_END" -v l="$2" '
+      $0 == b { on = 1 }
+      on && $0 == e { print l; on = 0 }
+      { print }' "$gi" >"$gi.gpm" && mv "$gi.gpm" "$gi"
+  else
+    if [ -s "$gi" ] && [ -n "$(tail -c1 "$gi")" ]; then echo >>"$gi"; fi
+    [ -s "$gi" ] && echo >>"$gi"
+    printf '%s\n%s\n%s\n' "$1" "$2" "$BLOCK_END" >>"$gi"
+  fi
+}
+
+block_remove() {  # <begin marker> <line>
+  local gi=$ROOT/.gitignore
+  [ -f "$gi" ] || return 0
+  awk -v b="$1" -v e="$BLOCK_END" -v l="$2" '
+    $0 == b { on = 1 }
+    on && $0 == e { on = 0 }
+    on && $0 == l { next }
+    { print }' "$gi" >"$gi.gpm" && mv "$gi.gpm" "$gi"
+}
+
+block_replace() {  # <begin marker> <old line> <new line>
+  local gi=$ROOT/.gitignore
+  awk -v b="$1" -v e="$BLOCK_END" -v o="$2" -v n="$3" '
+    $0 == b { on = 1 }
+    on && $0 == e { on = 0 }
+    on && $0 == o { print n; next }
+    { print }' "$gi" >"$gi.gpm" && mv "$gi.gpm" "$gi"
+}
+
+# The line number range of a block, as "first last" (the marker lines).
+block_span() {
+  [ -f "$ROOT/.gitignore" ] || return 0
+  awk -v b="$1" -v e="$BLOCK_END" '
+    $0 == b { s = NR; on = 1; next }
+    on && $0 == e { print s, NR; exit }' "$ROOT/.gitignore"
+}
+
+# --- sizes ------------------------------------------------------------------
+
+# "<bytes>\t<path>" for every file git would add: new, and not ignored.
+# Uses sync.sh's own scan, so the rules for what counts are in one place.
+untracked_sizes() {
+  (
+    cd "$ROOT" || exit 0
+    # shellcheck source=../lib/sync.sh
+    . "$LIB/sync.sh"
+    others=$(mktemp) || exit 0
+    git -c core.quotePath=false ls-files --others --exclude-standard >"$others" 2>/dev/null
+    sizes | awk -F'\t' 'NR == FNR { new[$0] = 1; next } ($2 in new)' "$others" -
+    rm -f "$others"
+  )
+}
+
+# Top-level folders whose new files add up to ASK_FOLDER_MB or more.
+large_folders() {
+  untracked_sizes | awk -F'\t' -v D=$((ASK_FOLDER_MB * 1048576)) '
+    index($2, "/") { split($2, p, "/"); tot[p[1]] += $1 }
+    END { for (d in tot) if (tot[d] >= D) print tot[d] "\t" d }' | sort -t "$(printf '\t')" -k2
+}
+
+bytes_under() {  # <rel path>: bytes of new files at or under it
+  untracked_sizes | awk -F'\t' -v p="$1" '
+    $2 == p || index($2, p "/") == 1 { t += $1 } END { print t + 0 }'
+}
+
+# Files at or under a path that GitHub would refuse, one per line.
+over_limit() {
+  local target=$ROOT/$1
+  [ -e "$target" ] || return 0
+  find "$target" -type f -size +"${LIMIT_MB}"M 2>/dev/null |
+    while IFS= read -r f; do printf '%s\n' "${f#"$ROOT"/}"; done
+}
+
+# --- git ------------------------------------------------------------------
+
+g() { git -C "$ROOT" "$@"; }
+
+commit_index() {  # <message>: commit what is staged, if anything
+  g diff --cached --quiet && return 1
+  g commit -q -m "$1" >/dev/null 2>&1
+}
+
+drop_pending() {  # <rel path>
+  local f=$ROOT/.git/gpm-pending
+  [ -f "$f" ] || return 0
+  awk -F'\t' -v p="$1" '{
+    q = $2; sub(/\/$/, "", q)
+    if (q == p || index(q, p "/") == 1 || index(p, q "/") == 1) next
+    print
+  }' "$f" >"$f.gpm" && mv "$f.gpm" "$f"
+  [ -s "$f" ] || rm -f "$f"
+}
+
+# --- keep and include -------------------------------------------------------
+
+# Keep a path on this computer only. Commits the change.
+do_keep() {
+  local rel=$1 line tracked
+  line=$(ignore_line "$rel")
+  if block_has "$BLOCK_BEGIN" "$line"; then
+    step "$rel is already kept on this computer"
+  else
+    block_add "$BLOCK_BEGIN" "$line"
+    step "added $line to .gitignore"
+  fi
+  g add -- .gitignore >/dev/null 2>&1
+  tracked=$(g ls-files -- "$rel" | head -1)
+  if [ -n "$tracked" ]; then
+    g rm -r -q --cached -- "$rel" >/dev/null 2>&1
+    step "$rel is no longer tracked. The copy already on GitHub stays in the repository's history; taking it out of history is a separate, destructive step that gpm does not take."
+  fi
+  if ! g check-ignore -q --no-index -- "$rel" 2>/dev/null; then
+    problem "a later line in .gitignore still un-ignores $rel: $(g check-ignore -v --no-index -n -- "$rel" | cut -f1)"
+  fi
+  drop_pending "$rel"
+  commit_index "Keep $rel on this computer only" && step "committed"
+  return 0
+}
+
+# The rule that ignores a path, as "source<TAB>line<TAB>pattern", or nothing.
+ignoring_rule() {
+  local out src rest num pat
+  out=$(g check-ignore -v --no-index -- "$1" 2>/dev/null | head -1) || return 0
+  [ -n "$out" ] || return 0
+  out=${out%%$'\t'*}
+  src=${out%%:*}; rest=${out#*:}; num=${rest%%:*}; pat=${rest#*:}
+  case $pat in '!'*) return 0 ;; esac
+  printf '%s\t%s\t%s\n' "$src" "$num" "$pat"
+}
+
+# Put a path on GitHub. Returns 0 done, 1 refused, 2 needs the user's yes.
+do_include() {
+  local rel=$1 yes=$2 target big rule src num pat span first last i
+  big=$(over_limit "$rel")
+  if [ -n "$big" ]; then
+    echo "REFUSED: GitHub rejects any file over $LIMIT_MB MB, and one in the push stops every other change reaching GitHub too, so every sync after it would fail:"
+    printf '%s\n' "$big" | sed 's/^/  - /'
+    echo "It stays on this computer. gpm does not use Git LFS."
+    return 1
+  fi
+  target=$rel
+  [ -d "$ROOT/$rel" ] && target=$rel/
+  # gpm's own lines for this path or anything under it are answers this one
+  # replaces: "/data/", or the "/data/*" and "!/data/analysis/" a
+  # subfolder's include left.
+  local l bare
+  while IFS= read -r l; do
+    bare=${l#!}; bare=${bare#/}; bare=${bare%\*}; bare=${bare%/}
+    if [ "$bare" = "$rel" ] || case $bare in "$rel"/*) true ;; *) false ;; esac; then
+      block_remove "$BLOCK_BEGIN" "$l"
+      step "removed $l from .gitignore"
+    fi
+  done < <(block_lines "$BLOCK_BEGIN")
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    rule=$(ignoring_rule "$target")
+    [ -n "$rule" ] || break
+    IFS=$'\t' read -r src num pat <<<"$rule"
+    span=$(block_span "$BLOCK_BEGIN")
+    first=${span% *}; last=${span#* }
+    if [ "$src" = .gitignore ] && [ -n "$span" ] && [ "$num" -gt "$first" ] && [ "$num" -lt "$last" ]; then
+      include_through_block "$rel" "$pat" || return 1
+    else
+      if [ "$yes" != 1 ]; then
+        echo "NEEDS CONFIRMATION: $rel is ignored by a rule gpm did not write, so gpm leaves that rule alone:"
+        echo "  $src line $num: $pat"
+        echo "  Re-run with --yes to add an exception (!/$rel) for it in gpm's block of .gitignore."
+        return 2
+      fi
+      local ex=!$(ignore_line "$rel")
+      block_add "$BLOCK_BEGIN" "$ex"
+      if [ -n "$(ignoring_rule "$target")" ]; then
+        block_remove "$BLOCK_BEGIN" "$ex"
+        echo "REFUSED: $pat ($src line $num) ignores a folder that $rel is inside, and git cannot un-ignore anything inside an ignored folder. That line has to change; it is the user's, so gpm does not edit it."
+        return 1
+      fi
+      step "added the exception $ex to .gitignore"
+    fi
+  done
+  g add -- .gitignore >/dev/null 2>&1
+  if [ -e "$ROOT/$rel" ]; then
+    g add -A -- "$rel" >/dev/null 2>&1
+  fi
+  drop_pending "$rel"
+  commit_index "Sync $rel to GitHub" && step "committed; it goes up with the next sync"
+  return 0
+}
+
+# A line in gpm's own block ignores this path: the path itself, or a folder
+# it sits in. For a folder, git cannot re-include anything below an excluded
+# directory, so "/data/" becomes "/data/*" plus an exception for each level
+# down to the path - the rest of the folder stays on this computer.
+include_through_block() {
+  local rel=$1 pat=$2 base sub parts acc k n
+  if [ "$pat" = "$(ignore_line "$rel")" ] || [ "$pat" = "/$rel" ] || [ "$pat" = "/$rel/" ]; then
+    block_remove "$BLOCK_BEGIN" "$pat"
+    step "removed $pat from .gitignore"
+    return 0
+  fi
+  case $pat in
+    */\*) base=${pat#/}; base=${base%/\*} ;;
+    */) base=${pat#/}; base=${base%/} ;;
+    *) echo "REFUSED: $pat in gpm's block ignores $rel, and gpm cannot tell how to open it up. Remove that line with \`gpm include\` on the folder it names."; return 1 ;;
+  esac
+  case $rel in "$base"/*) ;; *) echo "REFUSED: $pat ignores $rel in a way gpm did not expect."; return 1 ;; esac
+  [ "$pat" = "/$base/" ] && block_replace "$BLOCK_BEGIN" "$pat" "/$base/*"
+  sub=${rel#"$base"/}
+  IFS=/ read -r -a parts <<<"$sub"
+  n=${#parts[@]}
+  acc=$base
+  for ((k = 0; k < n; k++)); do
+    acc=$acc/${parts[k]}
+    if ((k < n - 1)); then
+      block_add "$BLOCK_BEGIN" "!/$acc/"
+      block_add "$BLOCK_BEGIN" "/$acc/*"
+    else
+      block_add "$BLOCK_BEGIN" "!$(ignore_line "$acc")"
+    fi
+  done
+  step "$base/ stays on this computer except $rel"
+  return 0
+}
+
+# --- hooks ------------------------------------------------------------------
+
+hook_commands() {  # <adapter file>: every command string in it
+  grep -o '"command": "[^"\\]*\(\\.[^"\\]*\)*"' "$1" |
+    sed 's/^"command": "//; s/"$//; s/\\"/"/g; s/\\\\/\\/g'
+}
+
+install_hooks_for() {  # <cli> ; writes into $ROOT
+  local cli=$1 adapter file
+  case $cli in
+    claude|claude-code) adapter=$ADAPTERS/claude-code.json; file=$CLAUDE_FILE ;;
+    codex) adapter=$ADAPTERS/codex.json; file=$CODEX_FILE ;;
+    agents|agents-md) install_agents_block; return ;;
+    *) problem "unknown CLI '$cli' (known: claude, codex, agents). For any other CLI, use \`gpm run <cli>\`."; return ;;
+  esac
+  if [ ! -e "$ROOT/$file" ]; then
+    mkdir -p "$(dirname "$ROOT/$file")"
+    cp "$adapter" "$ROOT/$file"
+    step "wrote $file"
+  elif find_python; then
+    local out
+    if out=$("$PYTHON" "$LIB/hooks_json.py" add "$ROOT/$file" "$adapter"); then
+      [ -n "$out" ] && step "$file: $out"
+    else
+      problem "$out"
+    fi
+  else
+    problem "$file already exists and there is no Python here to merge into it safely. Add the \"hooks\" entries from $adapter to it by hand (an agent can), then run \`gpm status\`."
+  fi
+}
+
+remove_hooks_for() {  # <cli>
+  local cli=$1 adapter file
+  case $cli in
+    claude) adapter=$ADAPTERS/claude-code.json; file=$CLAUDE_FILE ;;
+    codex) adapter=$ADAPTERS/codex.json; file=$CODEX_FILE ;;
+  esac
+  [ -e "$ROOT/$file" ] || return 0
+  if cmp -s "$adapter" "$ROOT/$file"; then
+    rm -f "$ROOT/$file"
+    rmdir "$(dirname "$ROOT/$file")" 2>/dev/null
+    step "removed $file"
+  elif find_python; then
+    local -a cmds=()
+    while IFS= read -r c; do cmds+=("$c"); done < <(hook_commands "$adapter")
+    local out
+    out=$("$PYTHON" "$LIB/hooks_json.py" remove "$ROOT/$file" "${cmds[@]}") || { problem "$out"; return; }
+    [ -n "$out" ] && step "$file: $out"
+  else
+    problem "no Python here to take gpm's hooks out of $file safely; remove the entries running .gpm/sync.sh by hand."
+  fi
+}
+
+has_hooks_for() {  # <cli>
+  local adapter file c
+  case $1 in
+    claude) adapter=$ADAPTERS/claude-code.json; file=$CLAUDE_FILE ;;
+    codex) adapter=$ADAPTERS/codex.json; file=$CODEX_FILE ;;
+  esac
+  [ -f "$ROOT/$file" ] || return 1
+  c=$(hook_commands "$adapter" | head -1)
+  grep -qF -- "$(printf '%s' "$c" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$ROOT/$file"
+}
+
+install_agents_block() {
+  local f=$ROOT/AGENTS.md
+  if [ -f "$f" ] && grep -qxF "$AGENTS_BEGIN" "$f"; then return 0; fi
+  if [ -s "$f" ]; then echo >>"$f"; fi
+  cat >>"$f" <<EOF
+$AGENTS_BEGIN
+## Keeping This Project on GitHub
+
+This folder is kept in step with its GitHub repository by
+[github-ai-project-manager](https://github.com/mercer-science/github-ai-project-manager).
+If your CLI did not run it for you, run \`bash .gpm/sync.sh start\` before
+any other work and relay anything it prints to the user, and run
+\`bash .gpm/sync.sh end\` as the last thing you do.
+$AGENTS_END
+EOF
+  step "added the sync instructions to AGENTS.md"
+}
+
+# gpm's own files must reach GitHub even when the project ignores their
+# folder (the paper engine's template ignores .claude/*).
+unignore_own_files() {
+  local f
+  for f in "$SYNC_PATH" "$CLAUDE_FILE" "$CODEX_FILE"; do
+    [ -e "$ROOT/$f" ] || continue
+    g check-ignore -q --no-index -- "$f" 2>/dev/null || continue
+    block_add "$OWN_BEGIN" "!/$f"
+    if g check-ignore -q --no-index -- "$f" 2>/dev/null; then
+      block_remove "$OWN_BEGIN" "!/$f"
+      problem "$f is inside a folder .gitignore ignores ($(g check-ignore -v --no-index -- "$f" | cut -f1)), so it cannot reach GitHub and a clone would not sync. Change that line to ignore the folder's contents (for example .claude/* instead of .claude/)."
+    else
+      step "let $f through .gitignore"
+    fi
+  done
+}
+
+install_sync() {
+  local target=$ROOT/$SYNC_PATH
+  if ! cmp -s "$LIB/sync.sh" "$target"; then
+    local verb=wrote
+    [ -e "$target" ] && verb=updated
+    mkdir -p "$ROOT/.gpm"
+    cp "$LIB/sync.sh" "$target"
+    chmod +x "$target" 2>/dev/null
+    step "$verb $SYNC_PATH"
+  fi
+}
+
+# --- the paper engine's sync --------------------------------------------------
+
+has_legacy() {
+  [ -f "$ROOT/$LEGACY_SCRIPT" ] && grep -qF -- "$LEGACY_SCRIPT_MARK" "$ROOT/$LEGACY_SCRIPT"
+}
+
+legacy_commands() {
+  local v
+  for v in start end report; do
+    printf 'bash "$CLAUDE_PROJECT_DIR/%s" %s\n' "$LEGACY_SCRIPT" "$v"
+  done
+}
+
+# The lines the old sync wrote into .gitignore, as "<line number>\t<line>":
+# the raw-data extensions and the "Kept off GitHub" block, not their comments.
+legacy_ignore_lines() {
+  [ -f "$ROOT/.gitignore" ] || return 0
+  awk -v raw="$LEGACY_RAW_MARKER" -v kept="$LEGACY_KEPT_HEADER" '
+    $0 == raw { inraw = 1 }
+    inraw && /^\*\./ { print NR "\t" $0; next }
+    inraw { inraw = 0 }
+    $0 == kept { inkept = 1; next }
+    inkept && /^#/ { next }
+    inkept && /^$/ { inkept = 0; next }
+    inkept { print NR "\t" $0 }' "$ROOT/.gitignore"
+}
+
+# Delete the old sync's lines, and their comment lines, from .gitignore.
+remove_legacy_ignore() {
+  local gi=$ROOT/.gitignore
+  [ -f "$gi" ] || return 0
+  awk -v raw="$LEGACY_RAW_MARKER" -v kept="$LEGACY_KEPT_HEADER" '
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (line[i] == raw) {
+          s = i; while (s > 1 && line[s - 1] ~ /^#/) s--
+          e = i; while (e < NR && line[e + 1] ~ /^\*\./) e++
+          for (j = s; j <= e; j++) drop[j] = 1
+        }
+        if (line[i] == kept) {
+          e = i; while (e < NR && line[e + 1] != "") e++
+          for (j = i; j <= e; j++) drop[j] = 1
+        }
+        if (line[i] == "!.claude/hooks/") drop[i] = 1
+        if (line[i] ~ /^# The project sync.s script, run by the hooks in/) drop[i] = 1
+      }
+      for (i = 1; i <= NR; i++) {
+        if (drop[i]) continue
+        # no run of blank lines left where a block was
+        if (line[i] == "" && (prev == "" || i == NR)) continue
+        print line[i]; prev = line[i]
+      }
+    }' "$gi" >"$gi.gpm" && mv "$gi.gpm" "$gi"
+}
+
+# A legacy line the user wants synced: refuse if a file it keeps off is over
+# the limit, since dropping it would put that file in the next push.
+legacy_line_blocked() {  # <pattern>
+  (cd "$ROOT" && git ls-files --others --ignored --exclude="$1" 2>/dev/null) |
+    while IFS= read -r f; do
+      [ -n "$(find "$ROOT/$f" -maxdepth 0 -type f -size +"${LIMIT_MB}"M 2>/dev/null)" ] && echo "$f"
+    done
+}
+
+take_over_legacy() {  # uses LEGACY_KEEP / LEGACY_SYNC arrays of lines
+  local l blocked
+  local -a keep_lines=() notes=()
+  for l in "${LEGACY_KEEP[@]+"${LEGACY_KEEP[@]}"}"; do
+    keep_lines+=("$l")
+    notes+=("kept $l on this computer (the user's answer)")
+  done
+  # Checked while the old lines still stand, since they decide what is
+  # ignored now.
+  for l in "${LEGACY_SYNC[@]+"${LEGACY_SYNC[@]}"}"; do
+    blocked=$(legacy_line_blocked "$l")
+    if [ -n "$blocked" ]; then
+      keep_lines+=("$l")
+      notes+=("kept $l anyway: it keeps a file over $LIMIT_MB MB off GitHub, which GitHub would refuse ($(printf '%s' "$blocked" | head -1))")
+    else
+      notes+=("$l will sync to GitHub (the user's answer)")
+    fi
+  done
+  # The old lines go first: gpm's block may hold the same text ("*.eer"),
+  # and the removal must not find it there.
+  remove_legacy_ignore
+  step "removed the old sync's lines from .gitignore"
+  for l in "${keep_lines[@]+"${keep_lines[@]}"}"; do block_add "$BLOCK_BEGIN" "$l"; done
+  for l in "${notes[@]+"${notes[@]}"}"; do step "$l"; done
+
+  if [ -f "$ROOT/$LEGACY_SETTINGS" ]; then
+    if find_python; then
+      local -a cmds=()
+      local out
+      while IFS= read -r l; do cmds+=("$l"); done < <(legacy_commands)
+      if out=$("$PYTHON" "$LIB/hooks_json.py" remove "$ROOT/$LEGACY_SETTINGS" "${cmds[@]}"); then
+        step "$LEGACY_SETTINGS: ${out:-no old hooks found}"
+      else
+        problem "$out"
+      fi
+    else
+      problem "no Python here to take the old hooks out of $LEGACY_SETTINGS safely. Remove its three entries that run .claude/hooks/sync.sh by hand, or both syncs will run."
+    fi
+  fi
+  rm -f "$ROOT/$LEGACY_SCRIPT" "$ROOT/.git/paper-engine-kept-off"
+  rmdir "$ROOT/.claude/hooks" 2>/dev/null
+  step "deleted $LEGACY_SCRIPT"
+}
+
+# --- commands -------------------------------------------------------------------
+
+slug() {
+  local s
+  s=$(printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^[-.]*//; s/[-.]*$//' | tr 'A-Z' 'a-z')
+  echo "${s:-project}"
+}
+
+interactive() { [ -t 0 ] && [ -t 1 ] && [ "${NO_INPUT:-0}" != 1 ]; }
+
+ask() {  # <prompt> ; answer on stdout
+  local a
+  printf '%s ' "$1" >/dev/tty
+  IFS= read -r a </dev/tty
+  printf '%s' "$a"
+}
+
+cloud_folder() {
+  local p=$1 v
+  case $p in
+    *OneDrive*|*Dropbox*|*"Google Drive"*|*GoogleDrive*|*iCloud*|*"Mobile Documents"*|*"Box Sync"*) return 0 ;;
+  esac
+  for v in "${OneDrive:-}" "${OneDriveCommercial:-}" "${OneDriveConsumer:-}"; do
+    [ -n "$v" ] || continue
+    v=$(cd "$v" 2>/dev/null && pwd) || continue
+    case $p in "$v"|"$v"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+cmd_connect() {
+  local path="" owner="" repo="" url="" public=0 context="" clis="claude,codex"
+  local allow_cloud=0
+  local -a suggest=() keep=() sync=()
+  LEGACY_KEEP=(); LEGACY_SYNC=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --owner) owner=$2; shift ;;
+      --repo) repo=$2; shift ;;
+      --url) url=$2; shift ;;
+      --public) public=1 ;;
+      --suggest-data) suggest+=("$2"); shift ;;
+      --context) context=$2; shift ;;
+      --keep) keep+=("$2"); shift ;;
+      --sync) sync+=("$2"); shift ;;
+      --cli) clis=$2; shift ;;
+      --allow-cloud-folder) allow_cloud=1 ;;
+      --no-input) NO_INPUT=1 ;;
+      -*) die "connect: unknown option $1" ;;
+      *) [ -z "$path" ] && path=$1 || die "connect: one folder at a time" ;;
+    esac
+    shift
+  done
+  [ -n "$path" ] || die "usage: gpm connect <folder> [options]  (gpm help)"
+  [ -d "$path" ] || die "no such folder: $path"
+  command -v git >/dev/null 2>&1 || die "git is not installed on this computer. Install it (https://git-scm.com), then re-run."
+  ROOT=$(cd "$path" && pwd)
+
+  if cloud_folder "$ROOT" && [ "$allow_cloud" != 1 ]; then
+    echo "REFUSED: $ROOT is inside a OneDrive, Dropbox, iCloud or Google Drive folder."
+    echo "  Two sync tools moving the same files corrupt a git repository. Move the project to an ordinary folder (for example ~/projects/) and connect it there, or re-run with --allow-cloud-folder if the user insists."
+    exit 1
+  fi
+
+  echo "Connecting $ROOT"
+  if [ ! -e "$ROOT/.git" ]; then
+    if ! g init -q -b main >/dev/null 2>&1; then   # git older than 2.28 has no -b
+      g init -q && g symbolic-ref HEAD refs/heads/main
+    fi
+    step "made the folder a git repository (branch main)"
+  fi
+  if [ -z "$(g config user.email)" ]; then
+    problem "git does not know your name and email on this computer. Run:
+  git config --global user.name \"Your Name\"
+  git config --global user.email \"you@example.edu\"
+then re-run this command."
+    exit 1
+  fi
+
+  # --- what needs the user's answer, before anything is committed
+  local remote proposed="" legacy=0
+  remote=$(g remote get-url origin 2>/dev/null)
+  if [ -z "$remote" ] && [ -z "$url" ] && [ -z "$repo" ]; then
+    # A repository's name is visible even when it is private, and renaming
+    # one later breaks every clone. So the name is the user's to confirm.
+    proposed=$(slug "$(basename "$ROOT")")
+  fi
+
+  local -a keep_rel=() sync_rel=() answered=() q_path=() q_why=() q_size=()
+  local a r
+  REL_BASE=$ROOT
+  has_legacy && legacy=1
+  local legacy_lines=""
+  [ "$legacy" = 1 ] && legacy_lines=$(legacy_ignore_lines | cut -f2)
+  for a in "${keep[@]+"${keep[@]}"}"; do
+    if [ -n "$legacy_lines" ] && printf '%s\n' "$legacy_lines" | grep -qxF -- "$a"; then
+      LEGACY_KEEP+=("$a")
+    else
+      r=$(rel_path "$a") || die "--keep $a is not inside the project"
+      keep_rel+=("$r"); answered+=("$r")
+    fi
+  done
+  for a in "${sync[@]+"${sync[@]}"}"; do
+    if [ -n "$legacy_lines" ] && printf '%s\n' "$legacy_lines" | grep -qxF -- "$a"; then
+      LEGACY_SYNC+=("$a")
+    else
+      r=$(rel_path "$a") || die "--sync $a is not inside the project"
+      sync_rel+=("$r"); answered+=("$r")
+    fi
+  done
+  while IFS= read -r l; do
+    l=${l#/}; l=${l%/}; [ -n "$l" ] && answered+=("$l")
+  done < <(block_lines "$BLOCK_BEGIN" | grep -v '^!')
+
+  is_answered() {  # a path, or a folder with an answer inside it or above it
+    local p=$1 x
+    for x in "${answered[@]+"${answered[@]}"}"; do
+      [ "$x" = "$p" ] && return 0
+      case $p in "$x"/*) return 0 ;; esac
+      case $x in "$p"/*) return 0 ;; esac
+    done
+    return 1
+  }
+  local s
+  for s in "${suggest[@]+"${suggest[@]}"}"; do
+    r=$(rel_path "$s") || die "--suggest-data $s is not inside the project"
+    [ -n "$r" ] || die "--suggest-data names the whole project"
+    is_answered "$r" && continue
+    q_path+=("$r"); q_why+=("suggested"); q_size+=("$(bytes_under "$r")")
+    answered+=("$r")
+  done
+  local size dir
+  while IFS=$'\t' read -r size dir; do
+    [ -n "$dir" ] || continue
+    is_answered "$dir" && continue
+    q_path+=("$dir"); q_why+=("large"); q_size+=("$size")
+  done < <(large_folders)
+  local -a q_legacy=()
+  if [ -n "$legacy_lines" ]; then
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      local hit=0 x
+      for x in "${LEGACY_KEEP[@]+"${LEGACY_KEEP[@]}"}" "${LEGACY_SYNC[@]+"${LEGACY_SYNC[@]}"}"; do
+        [ "$x" = "$l" ] && hit=1
+      done
+      [ "$hit" = 0 ] && q_legacy+=("$l")
+    done <<<"$legacy_lines"
+  fi
+
+  local n_q=$(( ${#q_path[@]} + ${#q_legacy[@]} ))
+  if [ -n "$proposed" ] || [ "$n_q" -gt 0 ]; then
+    if interactive; then
+      if [ -n "$proposed" ]; then
+        a=$(ask "Repository name (private) [${owner:+$owner/}$proposed]:")
+        repo=${a:-$proposed}
+      fi
+      local i
+      for i in "${!q_path[@]}"; do
+        a=$(ask "${q_path[i]}/ holds $(human "${q_size[i]}"). Keep it on this computer (recommended), or sync it to GitHub? [keep/sync]:")
+        case $a in s|sync|S|Sync) sync_rel+=("${q_path[i]}") ;; *) keep_rel+=("${q_path[i]}") ;; esac
+      done
+      for i in "${!q_legacy[@]}"; do
+        a=$(ask "The old sync kept ${q_legacy[i]} off GitHub. Keep it that way? [keep/sync]:")
+        case $a in s|sync|S|Sync) LEGACY_SYNC+=("${q_legacy[i]}") ;; *) LEGACY_KEEP+=("${q_legacy[i]}") ;; esac
+      done
+    else
+      echo
+      echo "NEEDS ANSWERS: nothing has been committed or created on GitHub yet. Ask the user:"
+      if [ -n "$proposed" ]; then
+        echo "name: ${owner:+$owner/}$proposed (private) - proposed. Re-run with --repo <name> once the user agrees to a name."
+      fi
+      local i
+      for i in "${!q_path[@]}"; do
+        local why="holds $(human "${q_size[i]}")"
+        [ "${q_why[i]}" = suggested ] && why="$why; the caller says data lives here"
+        echo "data: ${q_path[i]}/ ($why) - re-run with --keep ${q_path[i]} or --sync ${q_path[i]}"
+      done
+      for i in "${!q_legacy[@]}"; do
+        echo "old: ${q_legacy[i]} (the paper engine's old sync kept this off GitHub without asking) - re-run with --keep '${q_legacy[i]}' or --sync '${q_legacy[i]}'"
+      done
+      [ -n "$context" ] && echo "context: $context"
+      echo "Pass every answer given so far on the re-run, with the same options."
+      exit 3
+    fi
+  fi
+
+  # --- the answers go in before the first commit, so it already obeys them
+  for r in "${keep_rel[@]+"${keep_rel[@]}"}"; do
+    local line
+    line=$(ignore_line "$r")
+    block_has "$BLOCK_BEGIN" "$line" || { block_add "$BLOCK_BEGIN" "$line"; step "keeping $r on this computer (added $line to .gitignore)"; }
+  done
+  for r in "${sync_rel[@]+"${sync_rel[@]}"}"; do
+    local big
+    big=$(over_limit "$r")
+    [ -n "$big" ] && step "$r will sync, except the files over $LIMIT_MB MB in it, which GitHub refuses; they will be asked about one by one: $(printf '%s' "$big" | head -3 | tr '\n' ' ')"
+    if [ -n "$(ignoring_rule "$r")" ]; then
+      do_include "$r" 0 >/dev/null || step "$r is ignored by a rule gpm did not write; run \`gpm include $r\` to change that"
+    fi
+  done
+  [ "$legacy" = 1 ] && take_over_legacy
+
+  # --- the repository
+  if [ -z "$remote" ] && [ -n "$url" ]; then
+    g remote add origin "$url" && remote=$url && step "connected to $url"
+  fi
+  if [ -z "$remote" ]; then
+    local full=${owner:+$owner/}$repo gh
+    gh=$(command -v gh)
+    if [ -z "$gh" ] || ! "$gh" auth status >/dev/null 2>&1; then
+      local why="the GitHub command-line tool (gh) is not installed"
+      [ -n "$gh" ] && why="gh is not logged in (run: gh auth login)"
+      problem "Could not create the repository: $why. Either fix that and re-run, or create an EMPTY private repository at https://github.com/new (no README, no .gitignore, no licence) and re-run with --url <its https address>. The answers above are already saved."
+      exit 1
+    fi
+    local vis=--private
+    [ "$public" = 1 ] && vis=--public
+    local out
+    if ! out=$("$gh" repo create "$full" "$vis" --source "$ROOT" --remote origin 2>&1); then
+      problem "gh could not create the repository: $out"
+      exit 1
+    fi
+    remote=$(g remote get-url origin 2>/dev/null)
+    step "created the ${vis#--} repository $remote"
+  fi
+
+  # --- the sync and the hooks
+  install_sync
+  local cli
+  IFS=, read -r -a cli_list <<<"$clis"
+  for cli in "${cli_list[@]}"; do install_hooks_for "$cli"; done
+  unignore_own_files
+
+  local out
+  out=$(bash "$ROOT/$SYNC_PATH" start)
+  [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+  if g rev-parse -q --verify HEAD >/dev/null && g rev-parse -q --verify '@{u}' >/dev/null; then
+    step "the project is committed and on GitHub"
+    if [ "$PROBLEMS" = 0 ]; then
+      echo "Connected: $remote"
+      echo "From now on it syncs itself when an AI session opens and closes here. Data kept on this computer exists only here, and a project open on two computers at once can conflict; the sync then stops and says so, and never merges on its own."
+      exit 0
+    fi
+  fi
+  exit 1
+}
+
+cmd_sync() {
+  local verb=${1:-}
+  case $verb in start|end|push|report) ;; *) die "usage: gpm sync start|end|push|report" ;; esac
+  require_connected .
+  bash "$ROOT/$SYNC_PATH" "$verb"
+}
+
+cmd_run() {
+  [ $# -gt 0 ] || die "usage: gpm run <cli> [args...]"
+  local root
+  root=$(git rev-parse --show-toplevel 2>/dev/null)
+  if [ -z "$root" ] || [ ! -f "$root/$SYNC_PATH" ]; then
+    echo "gpm: this folder is not connected, so $1 runs without a sync." >&2
+    exec "$@"
+  fi
+  bash "$root/$SYNC_PATH" start
+  local status=0
+  "$@" || status=$?
+  # No hook time limit here, so the push runs in the foreground.
+  GPM_NO_DETACH=1 bash "$root/$SYNC_PATH" end
+  local last
+  last=$(cut -f3 "$root/.git/gpm-last-sync" 2>/dev/null)
+  [ "$last" = pushed ] || [ "$last" = committed ] ||
+    echo "Project sync: ${last:-the sync did not run}; everything is committed on this computer and goes up next time." >&2
+  return "$status"
+}
+
+cmd_pending() {
+  require_connected "${1:-.}"
+  local list
+  list=$(cd "$ROOT" && . "$LIB/sync.sh" && too_large)
+  if [ -z "$list" ]; then
+    echo "Nothing is waiting for an answer."
+    return 0
+  fi
+  echo "Held back from GitHub, waiting for the user's answer (gpm keep <path> or gpm include <path>):"
+  printf '%s\n' "$list" | while IFS=$'\t' read -r size p; do
+    echo "  - $p ($(human "$size"))"
+  done
+}
+
+cmd_keep() {
+  [ $# -ge 1 ] || die "usage: gpm keep <path>"
+  require_connected .
+  local rel
+  rel=$(rel_path "$1") || die "$1 is not inside the project ($ROOT)"
+  [ -n "$rel" ] || die "keep: that is the whole project"
+  do_keep "$rel"
+  [ "$PROBLEMS" = 0 ]
+}
+
+cmd_include() {
+  local yes=0 p=""
+  while [ $# -gt 0 ]; do
+    case $1 in --yes) yes=1 ;; *) p=$1 ;; esac
+    shift
+  done
+  [ -n "$p" ] || die "usage: gpm include <path> [--yes]"
+  require_connected .
+  local rel
+  rel=$(rel_path "$p") || die "$p is not inside the project ($ROOT)"
+  [ -n "$rel" ] || die "include: that is the whole project"
+  do_include "$rel" "$yes"
+}
+
+cmd_status() {
+  require_connected "${1:-.}"
+  local remote last pend
+  remote=$(g remote get-url origin 2>/dev/null)
+  echo "Project:   $ROOT"
+  echo "GitHub:    ${remote:-not connected}"
+  echo "Branch:    $(g symbolic-ref --short HEAD 2>/dev/null || echo '(detached)')"
+  if [ -f "$ROOT/.git/gpm-last-sync" ]; then
+    IFS=$'\t' read -r when what result <"$ROOT/.git/gpm-last-sync"
+    echo "Last sync: $when ($what: $result)"
+  else
+    echo "Last sync: never on this computer"
+  fi
+  local ahead
+  ahead=$(g rev-list --count '@{u}..HEAD' 2>/dev/null) && [ "$ahead" != 0 ] &&
+    echo "Unpushed:  $ahead commit(s), which go up with the next sync"
+  pend=$(cd "$ROOT" && . "$LIB/sync.sh" && too_large | wc -l | tr -d ' ')
+  echo "Pending:   ${pend:-0} path(s) waiting for an answer (gpm pending)"
+  echo "Kept on this computer:"
+  local kept
+  kept=$(block_lines "$BLOCK_BEGIN")
+  if [ -n "$kept" ]; then printf '%s\n' "$kept" | sed 's/^/  /'; else echo "  nothing"; fi
+  local c hooks=""
+  for c in claude codex; do has_hooks_for "$c" && hooks="$hooks $c"; done
+  echo "Hooks:    ${hooks:- none (use gpm run <cli>)}"
+  cmp -s "$LIB/sync.sh" "$ROOT/$SYNC_PATH" ||
+    echo "Sync:      $SYNC_PATH differs from the installed gpm ($VERSION); \`gpm upgrade\` replaces it"
+  has_legacy && echo "Old sync:  the paper engine's own sync is still here; \`gpm connect\` takes it over"
+  return 0
+}
+
+cmd_hooks() {
+  local clis=""
+  while [ $# -gt 0 ]; do
+    case $1 in --cli) clis=$2; shift ;; *) die "usage: gpm hooks --cli claude,codex" ;; esac
+    shift
+  done
+  [ -n "$clis" ] || die "usage: gpm hooks --cli claude,codex[,agents]"
+  require_connected .
+  local cli
+  IFS=, read -r -a cli_list <<<"$clis"
+  for cli in "${cli_list[@]}"; do install_hooks_for "$cli"; done
+  unignore_own_files
+  g add -- .gitignore "$CLAUDE_FILE" "$CODEX_FILE" AGENTS.md >/dev/null 2>&1
+  commit_index "Install gpm's session hooks" && step "committed"
+  [ "$PROBLEMS" = 0 ]
+}
+
+cmd_upgrade() {
+  require_connected "${1:-.}"
+  # Only the script. The hook commands never change: Codex trusts a hook by
+  # the hash of its configuration, and a changed command would sit untrusted
+  # - a sync that silently stopped.
+  if cmp -s "$LIB/sync.sh" "$ROOT/$SYNC_PATH"; then
+    echo "$SYNC_PATH is already the installed version ($VERSION)."
+    return 0
+  fi
+  install_sync
+  g add -- "$SYNC_PATH" >/dev/null 2>&1
+  commit_index "Upgrade the project sync to gpm $VERSION" && step "committed"
+  return 0
+}
+
+cmd_disconnect() {
+  require_connected "${1:-.}"
+  remove_hooks_for claude
+  remove_hooks_for codex
+  if [ -f "$ROOT/AGENTS.md" ] && grep -qxF "$AGENTS_BEGIN" "$ROOT/AGENTS.md"; then
+    awk -v b="$AGENTS_BEGIN" -v e="$AGENTS_END" '
+      $0 == b { on = 1; next } on && $0 == e { on = 0; next } !on' \
+      "$ROOT/AGENTS.md" >"$ROOT/AGENTS.md.gpm" && mv "$ROOT/AGENTS.md.gpm" "$ROOT/AGENTS.md"
+    step "removed the sync instructions from AGENTS.md"
+  fi
+  local own
+  while IFS= read -r own; do block_remove "$OWN_BEGIN" "$own"; done < <(block_lines "$OWN_BEGIN")
+  if [ -f "$ROOT/.gitignore" ]; then
+    awk -v b="$OWN_BEGIN" -v e="$BLOCK_END" '
+      $0 == b { getline nxt; if (nxt == e) next; print; print nxt; next } { print }' \
+      "$ROOT/.gitignore" >"$ROOT/.gitignore.gpm" && mv "$ROOT/.gitignore.gpm" "$ROOT/.gitignore"
+  fi
+  g rm -r -q --cached --ignore-unmatch -- .gpm >/dev/null 2>&1
+  rm -rf "$ROOT/.gpm" "$ROOT/.git/gpm-pending" "$ROOT/.git/gpm-last-sync"
+  step "removed $SYNC_PATH"
+  g add -A -- .gitignore "$CLAUDE_FILE" "$CODEX_FILE" AGENTS.md >/dev/null 2>&1
+  commit_index "Disconnect gpm's sync" && step "committed"
+  if g remote get-url origin >/dev/null 2>&1; then
+    if g push -q origin HEAD >/dev/null 2>&1; then step "pushed"; else step "could not push; run git push when online"; fi
+  fi
+  echo "Disconnected. The repository, its history and .gitignore are unchanged, and nothing on GitHub was deleted."
+}
+
+cmd_help() {
+  cat <<EOF
+gpm $VERSION - keep a project folder on GitHub from any AI CLI
+
+  gpm connect <folder> [--repo NAME] [--owner ORG] [--url URL] [--public]
+              [--suggest-data PATH]... [--context SENTENCE]
+              [--keep PATH]... [--sync PATH]... [--cli claude,codex,agents]
+              [--allow-cloud-folder] [--no-input]
+      Make the folder a private GitHub repository and keep it in step.
+      Without --repo it proposes a name and stops; without an answer for
+      each data folder it asks and stops. Exit 3 means "needs answers".
+  gpm sync start|end|push|report    what the hooks run
+  gpm run <cli> [args...]           sync, run the CLI, sync (no time limit)
+  gpm pending                       new, large files held back for an answer
+  gpm keep <path>                   keep it on this computer only
+  gpm include <path> [--yes]        put it on GitHub (the un-ignore)
+  gpm status                        what is connected, synced, kept, pending
+  gpm hooks --cli claude,codex      (re)write the hook files
+  gpm upgrade                       replace .gpm/sync.sh with this version
+  gpm disconnect                    remove the hooks and .gpm/; keep the repository
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    connect) cmd_connect "$@" ;;
+    sync) cmd_sync "$@" ;;
+    run) cmd_run "$@" ;;
+    pending) cmd_pending "$@" ;;
+    keep) cmd_keep "$@" ;;
+    include) cmd_include "$@" ;;
+    status) cmd_status "$@" ;;
+    hooks) cmd_hooks "$@" ;;
+    upgrade) cmd_upgrade "$@" ;;
+    disconnect) cmd_disconnect "$@" ;;
+    version|--version) echo "gpm $VERSION" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "unknown command '$cmd'. Run \`gpm help\`." ;;
+  esac
+}
+
+main "$@"
