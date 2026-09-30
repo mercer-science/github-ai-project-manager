@@ -220,9 +220,12 @@ def test_contracts():
 
     engine = os.path.join(os.path.dirname(REPO), "paper-engine")
     legacy = os.path.join(engine, "tools", "project_template", "dotfiles")
-    if not os.path.isdir(legacy):
+    # Once the engine hands its sync to gpm it deletes these files, and the
+    # constants above stay the record of the last version gpm must detect.
+    if not os.path.exists(os.path.join(legacy, "sync.sh")):
         skip("the engine's own files carry the detection strings",
-             "no paper-engine checkout beside this one")
+             "no engine sync.sh beside this checkout (none, or already "
+             "handed over to gpm)")
         return
     script = open(os.path.join(legacy, "sync.sh"), encoding="utf-8").read()
     settings = json.load(open(os.path.join(legacy, "settings.local.json")))
