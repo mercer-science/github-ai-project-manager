@@ -80,9 +80,10 @@ new_files() {
     >"$others" 2>/dev/null
   if [ -s "$others" ]; then
     sizes |
-      awk -F'\t' -v exts="$DATA_EXT" '
+      # One line: BSD awk (macOS) refuses a newline in a -v value.
+      awk -F'\t' -v exts="$(printf '%s ' $DATA_EXT)" '
         BEGIN {
-          n = split(exts, e, /[ \n]+/)
+          n = split(exts, e, " ")
           for (i = 1; i <= n; i++) if (e[i] != "") ext[e[i]] = 1
         }
         FILENAME == ARGV[1] { new[$0] = 1; next }
