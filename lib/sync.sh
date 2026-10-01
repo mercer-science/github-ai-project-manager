@@ -23,13 +23,16 @@
 # which is why `start` commits first: nothing typed is lost, it only goes up
 # a session late.
 #
-# Nothing is ever ignored here. A new file of HOLD_MB or more, or a new
-# folder whose new files add up to HOLD_DIR_MB or more, is HELD BACK: left
-# out of the commit and listed in .git/gpm-pending, and the next session
-# opens by asking the user about it. One file over 100 MB makes GitHub refuse
-# the whole push, so committing it would stop everything else reaching
-# GitHub; holding it back decides nothing about it. The user's answers live
-# in the marked block in .gitignore, which `gpm keep` and `gpm include` write.
+# Nothing is ever ignored here. A new file of HOLD_MB or more, a new folder
+# whose new files add up to HOLD_DIR_MB or more, and a new data file of any
+# size (DATA_EXT) are HELD BACK: left out of the commit and listed in
+# .git/gpm-pending, and the next session opens by asking the user about them.
+# Data is assumed to stay on this computer until the user says otherwise, and
+# one file over 100 MB makes GitHub refuse the whole push, so committing it
+# would stop everything else reaching GitHub; holding it back decides nothing
+# about it. The user's answers live in the marked block in .gitignore (kept
+# here) and in SYNCED (folders whose new data syncs without asking), which
+# `gpm keep` and `gpm include` write.
 #
 # Silent when there is nothing to say. What `start` and `report` print is read
 # by the agent at the top of the session, so a problem is reported rather than
@@ -39,6 +42,15 @@
 HOLD_MB=50
 HOLD_DIR_MB=500
 PENDING=.git/gpm-pending
+SYNCED=.gpm/synced-data
+# What counts as data, by extension, case-insensitive. It decides when to
+# ask, never what the answer is, and says nothing about what the project is.
+DATA_EXT="csv tsv xls xlsx xlsm ods parquet feather arrow avro orc jsonl ndjson
+  h5 hdf5 hdf he5 nc nc4 cdf npy npz mat pkl pickle joblib rds rda rdata sav dta
+  sas7bdat sqlite sqlite3 db duckdb tif tiff mrc mrcs eer dm3 dm4 ser emd nd2
+  czi lif lsm ims dcm nii fcs fastq fq fasta fa fna bam sam cram vcf bcf bed
+  bigwig bw gff gtf zip tar gz tgz bz2 xz zst 7z rar mp4 mov avi mkv wav flac
+  bin dat raw pt pth ckpt safetensors onnx"
 LAST=.git/gpm-last-sync
 
 say() { echo "Project sync: $*"; }
@@ -55,52 +67,80 @@ sizes() {
   fi
 }
 
-# Every new, not-yet-ignored path that is too large, as "<bytes>\t<path>",
-# a folder ending in "/". One `find` and one `awk` whatever the file count:
-# a per-file `stat` costs a process each, and Git Bash on Windows spawns
-# slowly enough that a folder of movies would outlast the hook's time limit.
-too_large() {
-  local others
+# "<bytes>\t<path>\t<kind>" for every new, not-yet-ignored file. kind is
+# "data" for a data file that no answer in SYNCED covers, and "-" otherwise.
+# One `find` and one `awk` whatever the file count: a per-file `stat` costs a
+# process each, and Git Bash on Windows spawns slowly enough that a folder of
+# movies would outlast the hook's time limit.
+new_files() {
+  local others synced=/dev/null
   others=$(mktemp) || return 0
+  [ -f "$SYNCED" ] && synced=$SYNCED
   git -c core.quotePath=false ls-files --others --exclude-standard \
     >"$others" 2>/dev/null
   if [ -s "$others" ]; then
     sizes |
-      awk -F'\t' -v F=$((HOLD_MB * 1048576)) -v D=$((HOLD_DIR_MB * 1048576)) '
-        NR == FNR { new[$0] = 1; next }
+      awk -F'\t' -v exts="$DATA_EXT" '
+        BEGIN {
+          n = split(exts, e, /[ \n]+/)
+          for (i = 1; i <= n; i++) if (e[i] != "") ext[e[i]] = 1
+        }
+        FILENAME == ARGV[1] { new[$0] = 1; next }
+        FILENAME == ARGV[2] {
+          sub(/\r$/, ""); sub(/\/$/, ""); if ($0 != "") ok[$0] = 1; next
+        }
         !($2 in new) { next }
         {
-          n = split($2, part, "/"); d = ""
-          for (i = 1; i < n; i++) { d = d part[i] "/"; tot[d] += $1 }
-          if ($1 >= F) big[$2] = $1
-        }
-        END {
-          # The deepest folders over the limit, so a movie folder is asked
-          # about without taking the whole data/ tree with it.
-          for (d in tot) if (tot[d] >= D) over[d] = 1
-          for (d in over) {
-            deepest = 1
-            for (e in over) if (e != d && index(e, d) == 1) { deepest = 0; break }
-            if (deepest) pick[d] = tot[d]
+          kind = "-"
+          b = tolower($2); sub(/.*\//, "", b)
+          if (index(b, ".") > 1) {
+            x = b; sub(/.*\./, "", x)
+            if (x in ext) {
+              kind = "data"
+              for (s in ok) if ($2 == s || index($2, s "/") == 1) { kind = "-"; break }
+            }
           }
-          for (p in big) {
-            inside = 0
-            for (d in pick) if (index(p, d) == 1) { inside = 1; break }
-            if (inside) continue
-            par = p; sub(/[^\/]*$/, "", par)
-            count[par]++; loose[p] = par
-          }
-          # Five large files side by side is a data folder, not five
-          # questions: one question about the folder.
-          for (p in loose) {
-            par = loose[p]
-            if (par != "" && count[par] >= 5) pick[par] = tot[par]
-            else print big[p] "\t" p
-          }
-          for (d in pick) print pick[d] "\t" d
-        }' "$others" - | sort -t "$(printf '\t')" -k2
+          print $1 "\t" $2 "\t" kind
+        }' "$others" "$synced" -
   fi
   rm -f "$others"
+}
+
+# Every new path to hold back, as "<bytes>\t<path>", a folder ending in "/":
+# too large, or data nobody has said to sync.
+held_back() {
+  new_files |
+    awk -F'\t' -v F=$((HOLD_MB * 1048576)) -v D=$((HOLD_DIR_MB * 1048576)) '
+      {
+        n = split($2, part, "/"); d = ""
+        for (i = 1; i < n; i++) { d = d part[i] "/"; tot[d] += $1 }
+        if ($1 >= F || $3 == "data") hold[$2] = $1
+      }
+      END {
+        # The deepest folders over the limit, so a movie folder is asked
+        # about without taking the whole data/ tree with it.
+        for (d in tot) if (tot[d] >= D) over[d] = 1
+        for (d in over) {
+          deepest = 1
+          for (e in over) if (e != d && index(e, d) == 1) { deepest = 0; break }
+          if (deepest) pick[d] = tot[d]
+        }
+        for (p in hold) {
+          inside = 0
+          for (d in pick) if (index(p, d) == 1) { inside = 1; break }
+          if (inside) continue
+          par = p; sub(/[^\/]*$/, "", par)
+          count[par]++; loose[p] = par
+        }
+        # Five held files side by side is a data folder, not five
+        # questions: one question about the folder.
+        for (p in loose) {
+          par = loose[p]
+          if (par != "" && count[par] >= 5) pick[par] = tot[par]
+          else print hold[p] "\t" p
+        }
+        for (d in pick) print pick[d] "\t" d
+      }' | sort -t "$(printf '\t')" -k2
 }
 
 # Commit everything except what is held back. Returns 1 when there was
@@ -108,7 +148,7 @@ too_large() {
 save() {
   local list size path
   local -a skip=()
-  list=$(too_large)
+  list=$(held_back)
   : >"$PENDING"
   if [ -n "$list" ]; then
     printf '%s\n' "$list" >"$PENDING"
@@ -125,13 +165,14 @@ save() {
 
 report_pending() {
   [ -s "$PENDING" ] || return 0
-  say "these are new and large, so they were held back from GitHub and nothing has been decided about them:"
+  say "these are new data or large files, so they were held back from GitHub and nothing has been decided about them:"
   awk -F'\t' '{
-    s = $1 / 1048576; u = "MB"
+    s = $1 / 1024; u = "KB"
+    if (s >= 1024) { s /= 1024; u = "MB" }
     if (s >= 1024) { s /= 1024; u = "GB" }
     printf "  - %s (%.1f %s)\n", $2, s, u
   }' "$PENDING"
-  echo "  Ask the user, for each one, whether to sync it to GitHub or keep it on this computer only (recommend keeping it here). Then run \`gpm keep <path>\` or \`gpm include <path>\`. Until they answer, it stays out of every commit."
+  echo "  Ask the user, for each one, whether to sync it to GitHub or keep it on this computer only (recommend keeping it here). Then run \`gpm keep <path>\` or \`gpm include <path>\`. Until they answer, it stays out of every commit; new data is never uploaded unasked."
 }
 
 has_remote() { git remote get-url origin >/dev/null 2>&1; }
@@ -238,8 +279,8 @@ main() {
 esac
 }
 
-# gpm loads this file for too_large and sizes, so the size rules live in one
-# place; run as a script, it syncs.
+# gpm loads this file for held_back and new_files, so the rules for what is
+# held back live in one place; run as a script, it syncs.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   main "$@"
   exit 0

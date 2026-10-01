@@ -4,15 +4,18 @@ Keep a project folder on GitHub as a private repository, synced at the start
 and end of every AI coding session, in Claude Code, Codex or any other CLI.
 
 - **One command to connect.** `gpm connect <folder>` makes the folder a
-  private repository and syncs it. It asks for the repository's name and
-  about each large data folder first.
+  private repository and syncs it. It asks for the repository's name first,
+  and whether any of the project's data should go to GitHub at all.
 - **It syncs itself.** When a session opens, it commits whatever the last
   session left unsaved, brings in the other computer's work, and pushes. When
   a session closes, it commits and pushes. Closing the terminal window loses
   nothing: the next session commits it.
 - **Your data is your decision.** Nothing is kept off GitHub, or put on it,
-  without your answer. A large file that appears later is held back until you
-  have answered for it. You can put anything back on GitHub later by asking.
+  without your answer. Data that appears later (a spreadsheet, an image
+  stack, an archive, any size) and any large file are assumed to stay on this
+  computer: they are held back until you have answered for them. A folder you
+  said to sync takes new data without asking. You can put anything back on
+  GitHub later by asking.
 - **Nothing but git.** `gpm` is a bash script. Git for Windows ships bash, so
   there is nothing else to install. A clone keeps syncing on a computer that
   has never installed `gpm`.

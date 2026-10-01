@@ -34,8 +34,9 @@ which command, the exact wording of the data question, what exit code 3
 means, and how to walk a user through a conflict. In short:
 
 - `gpm connect <folder>` **stops with exit 3** until the user has confirmed
-  the repository name and answered for each data folder. Put every `name:`,
-  `data:` and `old:` line to the user, then re-run with every answer.
+  the repository name and answered for every place data sits, small or
+  large. Put every `name:`, `data:` and `old:` line to the user, then re-run
+  with every answer (`--keep-all-data` when they want none of it uploaded).
 - A session that opens with `Project sync:` lines: relay them. A "held back"
   path gets the data question; the answer is `gpm keep` or `gpm include`.
 - Never edit the lines between gpm's markers in `.gitignore` by hand. They
@@ -50,10 +51,14 @@ with `gpm run <cli>`.
 
 These hold for every change to this repository:
 
-1. **Nothing is ignored or un-ignored without the user's answer.** A large
-   new file is *held back* (excluded from the commit and listed in
-   `.git/gpm-pending`), never written into `.gitignore`. The thresholds
-   (50 MB a file, 500 MB a folder) decide when to ask, never what the answer is.
+1. **Nothing is ignored or un-ignored without the user's answer, and no data
+   goes up unasked.** `connect` asks about every place data sits, whatever
+   its size. After that, a new data file (by extension, `DATA_EXT` in
+   `lib/sync.sh`) or a large new file is *held back* (excluded from the
+   commit and listed in `.git/gpm-pending`), never written into `.gitignore`.
+   Only a folder the user said to sync (recorded in `.gpm/synced-data`)
+   takes new data without asking. The extensions and thresholds (50 MB a
+   file, 500 MB a folder) decide when to ask, never what the answer is.
 2. **One refusal overrides the user:** a file over 100 MB never goes on
    GitHub, because it would make every later push fail. There is no Git LFS.
 3. **No public repository** unless the user asked for one by name. **No
@@ -65,7 +70,8 @@ These hold for every change to this repository:
    configuration, and a changed command sits untrusted, which is a sync that
    silently stopped. Change `lib/sync.sh` instead; `gpm upgrade` replaces
    the project's copy and leaves the commands alone.
-6. **Contracts are pinned.** The hook commands, the `.gitignore` markers and
+6. **Contracts are pinned.** The hook commands, the `.gitignore` markers, the
+   `.gpm/synced-data` path and
    the paper engine's detection strings each have one constant that
    `tests/test_gpm.py` compares with every file that carries a copy. Change
    one, change all, re-run the suite.

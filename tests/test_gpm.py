@@ -40,6 +40,7 @@ CODEX_CMD = ("bash -c 'd=$(git rev-parse --show-toplevel 2>/dev/null) && "
 CODEX_WIN = ('if exist "%ProgramFiles%\\Git\\bin\\bash.exe" '
              '("%ProgramFiles%\\Git\\bin\\bash.exe" .gpm/sync.sh {0}) else '
              '("%LOCALAPPDATA%\\Programs\\Git\\bin\\bash.exe" .gpm/sync.sh {0})')
+SYNCED_PATH = ".gpm/synced-data"
 LEGACY_CMD = 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/sync.sh" {}'
 LEGACY_MARK = "KEPT_NOTE=.git/paper-engine-kept-off"
 LEGACY_KEPT_HEADER = ("# Kept off GitHub by the project sync: too large for a "
@@ -213,6 +214,9 @@ def test_contracts():
         check(f"{name}: the end hook fits the CLI's limit ({end_timeout}s)",
               got[2]["timeout"] == end_timeout, got[2])
 
+    check("bin/gpm and sync.sh name the same record of synced data folders",
+          f'SYNCED_PATH="{SYNCED_PATH}"' in gpm
+          and f"SYNCED={SYNCED_PATH}" in sync)
     check("sync.sh holds back at 50 MB a file and 500 MB a folder",
           "HOLD_MB=50" in sync and "HOLD_DIR_MB=500" in sync)
     check("sync.sh carries the header gpm's status and upgrade look for",
@@ -256,18 +260,20 @@ def test_connect_asks_first():
               "name: example_study (private)" in text, text)
         check("...asking about the folder over 100 MB",
               "data: data/ (holds 120.0 MB)" in text, text)
-        check("...and not about a small one", "scans/" not in text, text)
+        check("...about a small folder of data too",
+              "data: scans/ (holds 30.0 MB; 1 data file)" in text, text)
+        check("...and not about a folder with no data", "notes/" not in text, text)
         check("...having committed nothing",
               sb.git("-C", proj, "rev-parse", "-q", "--verify", "HEAD").returncode != 0)
         check("...and having no remote",
               sb.git("-C", proj, "remote").stdout.strip() == "")
 
         r = sb.gpm("connect", proj, "--repo", "example-study",
-                   "--suggest-data", "scans", "--context",
+                   "--suggest-data", "notes", "--context",
                    "data/ also holds the analysis scripts.")
         text = out(r)
         check("a caller's suggested folder is asked about too",
-              "data: scans/ (holds 30.0 MB; the caller says data lives here)" in text, text)
+              "data: notes/ (holds 0.0 KB; the caller says data lives here)" in text, text)
         check("...and the caller's sentence is passed on, not acted on",
               "context: data/ also holds the analysis scripts." in text, text)
 
@@ -531,6 +537,74 @@ def test_hold_back():
         sb.clean()
 
 
+def test_data_assumed_kept():
+    section("Data of any size is asked about at connect and held back after")
+    sb = Sandbox()
+    try:
+        proj = sb.project()
+        write(proj, "data/raw/a.csv", "1,2\n")
+        write(proj, "data/raw/b.csv", "3,4\n")
+        write(proj, "data/proc/c.parquet", "p")
+        write(proj, "summary.XLSX", "x")
+        write(proj, "data/README.md", "about the data\n")
+
+        r = sb.connect(proj)
+        text = out(r)
+        check("small data stops connect with exit 3", r.returncode == 3, text)
+        check("...one question per folder that holds data",
+              "data: data/raw/ (" in text and "2 data files" in text
+              and "data: data/proc/ (" in text, text)
+        check("...a data file at the top is asked about as a file, any case",
+              "data: summary.XLSX (" in text, text)
+        check("...and the way to say none of it goes up",
+              "--keep-all-data" in text, text)
+
+        r = sb.connect(proj, "--sync", "summary.XLSX", "--keep-all-data")
+        check("--keep-all-data answers keep for every one left", r.returncode == 0, out(r))
+        check("...each one a line in the managed block",
+              block(proj) == ["/data/proc/", "/data/raw/"], block(proj))
+        pushed = sb.remote_files()
+        check("...and none of that data is on the remote, the rest is",
+              "data/README.md" in pushed and not any(
+                  p.endswith((".csv", ".parquet")) for p in pushed), pushed)
+        check("a data file the user said to sync goes up, not held back",
+              "summary.XLSX" in pushed, pushed)
+
+        # new data after connect: held back, never ignored, never uploaded
+        gi_before = read(proj, ".gitignore")
+        write(proj, "results/fit.csv", "a\n")
+        write(proj, "results/fit.R", "fit()\n")
+        env = dict(sb.env, GPM_NO_DETACH="1")
+        sb.sync(proj, "end", env=env)
+        pushed = sb.remote_files()
+        check("a new small data file is held back; the script beside it goes up",
+              "results/fit.R" in pushed and "results/fit.csv" not in pushed, pushed)
+        check("...with .gitignore untouched", read(proj, ".gitignore") == gi_before)
+        r = sb.sync(proj, "start")
+        check("...and the next start asks about it",
+              "held back from GitHub" in r.stdout and "results/fit.csv" in r.stdout,
+              r.stdout)
+
+        r = sb.gpm("include", "results", cwd=proj)
+        check("include on its folder commits it", r.returncode == 0
+              and "results/fit.csv" in sb.git("-C", proj, "ls-files").stdout, out(r))
+        check("...and records the folder as synced",
+              read(proj, SYNCED_PATH).splitlines() == ["results"])
+        write(proj, "results/fit2.csv", "b\n")
+        sb.sync(proj, "end", env=env)
+        check("new data in a folder the user said to sync goes up unasked",
+              "results/fit2.csv" in sb.remote_files() and
+              SYNCED_PATH in sb.remote_files())
+        r = sb.gpm("keep", "results", cwd=proj)
+        check("keep on it drops the record", r.returncode == 0
+              and read(proj, SYNCED_PATH).strip() == "", out(r))
+
+        r = sb.gpm("connect", proj, "--url", sb.bare)
+        check("a later connect asks nothing more", r.returncode == 0, out(r))
+    finally:
+        sb.clean()
+
+
 def test_keep_and_include():
     section("keep and include: the user's answers, later")
     sb = Sandbox()
@@ -770,6 +844,7 @@ def main():
     test_detached_push_survives_group_kill()
     test_conflict_and_offline()
     test_hold_back()
+    test_data_assumed_kept()
     test_keep_and_include()
     test_take_over_from_engine()
     test_upgrade_hooks_disconnect()

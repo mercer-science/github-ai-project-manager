@@ -60,7 +60,16 @@ not seen. It goes on the user's own account unless they name an organisation
 (`--owner ORG`). **Never pass `--public`** unless the user asked for a public
 repository in those words.
 
-**Each `data:` line.** Ask exactly this, filling in the folder and size:
+**The `data:` lines.** Every place data sits is listed, however small: a
+folder holding data files, or a data file at the top of the project. Nothing
+of it goes to GitHub unless the user says so. Ask first, in one question:
+
+> This project holds data: `data/raw/` (12.4 GB), `summary.xlsx` (40 KB).
+> Should any of it go to GitHub? **Recommended: no, keep it all on this
+> computer.**
+
+If they say none of it, re-run with `--keep-all-data`. Otherwise, for each
+`data:` line, ask exactly this, filling in the folder and size:
 
 > **`data/`** holds 12.4 GB. Do you want it synced to GitHub, or kept just on
 > this computer?
@@ -128,9 +137,10 @@ left on their own computer: `git clone` it and open a session there.
 
 Relay each line to the user. The two that need more than relaying:
 
-**"held back from GitHub"** lists new, large files that nobody has answered
-for. They are in no commit and in no `.gitignore`, so nothing has been
-decided about them. Put the data question above to the user, for each one,
+**"held back from GitHub"** lists new data files (of any size) and new large
+files that nobody has answered for. New data is assumed to stay on this
+computer until the user says otherwise. They are in no commit and in no
+`.gitignore`, so nothing has been decided about them. Put the data question above to the user, for each one,
 and run `keep <path>` or `include <path>` with the answer.
 
 **"both changed the same file"** means this computer and GitHub each have
@@ -153,7 +163,8 @@ already on GitHub, gpm says the copy there stays in the repository's history.
 Taking it out of history is a separate, destructive step. gpm does not take
 it, and you do not offer it unless the user asks.
 
-`include <path>`:
+`include <path>`: for a folder, the answer also covers data added to it
+later, which then syncs without being held back. `keep` on it undoes that.
 
 - **Exit 1, `REFUSED`, a file over 100 MB.** Relay why: GitHub rejects the
   push, and every sync after it would fail. The file stays on this computer.

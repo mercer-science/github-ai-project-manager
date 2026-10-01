@@ -21,6 +21,7 @@ BLOCK_END="# --- end ---"
 AGENTS_BEGIN="<!-- github-ai-project-manager: sync -->"
 AGENTS_END="<!-- /github-ai-project-manager -->"
 SYNC_PATH=".gpm/sync.sh"
+SYNCED_PATH=".gpm/synced-data"   # folders whose new data syncs; sync.sh reads it
 CLAUDE_FILE=".claude/settings.json"
 CODEX_FILE=".codex/hooks.json"
 # The paper engine's own sync, which `connect` takes over (spec §7).
@@ -52,7 +53,8 @@ PROBLEMS=0
 
 human() {
   awk -v b="$1" 'BEGIN {
-    s = b / 1048576; u = "MB"
+    s = b / 1024; u = "KB"
+    if (s >= 1024) { s /= 1024; u = "MB" }
     if (s >= 1024) { s /= 1024; u = "GB" }
     printf "%.1f %s", s, u
   }'
@@ -206,18 +208,37 @@ block_span() {
 
 # --- sizes ------------------------------------------------------------------
 
-# "<bytes>\t<path>" for every file git would add: new, and not ignored.
-# Uses sync.sh's own scan, so the rules for what counts are in one place.
-untracked_sizes() {
+# "<bytes>\t<path>\t<kind>" for every file git would add: new, and not
+# ignored; kind is "data" for a data file nobody has said to sync. Uses
+# sync.sh's own scan, so the rules for what counts are in one place.
+project_files() {
   (
     cd "$ROOT" || exit 0
     # shellcheck source=../lib/sync.sh
     . "$LIB/sync.sh"
-    others=$(mktemp) || exit 0
-    git -c core.quotePath=false ls-files --others --exclude-standard >"$others" 2>/dev/null
-    sizes | awk -F'\t' 'NR == FNR { new[$0] = 1; next } ($2 in new)' "$others" -
-    rm -f "$others"
+    new_files
   )
+}
+
+untracked_sizes() { project_files | cut -f1,2; }
+
+# Where the project's new data sits, as "<files>\t<path>": the folder holding
+# each data file, or the file itself at the top of the project. A folder
+# takes in the folders below it, so data/ is one question, not one per run.
+data_places() {
+  project_files | awk -F'\t' '
+    $3 != "data" { next }
+    { p = $2; if (index(p, "/")) sub(/\/[^\/]*$/, "", p); n[p]++ }
+    END {
+      for (p in n) {
+        top = 1
+        for (q in n) if (q != p && index(p, q "/") == 1) { top = 0; break }
+        if (!top) continue
+        t = 0
+        for (q in n) if (q == p || index(q, p "/") == 1) t += n[q]
+        print t "\t" p
+      }
+    }' | sort -t "$(printf '\t')" -k2
 }
 
 # Top-level folders whose new files add up to ASK_FOLDER_MB or more.
@@ -260,6 +281,23 @@ drop_pending() {  # <rel path>
   [ -s "$f" ] || rm -f "$f"
 }
 
+# The folders the user said to sync, whose new data then syncs without
+# asking. One path per line, relative to the project, no trailing "/".
+synced_add() {  # <rel folder>
+  local f=$ROOT/$SYNCED_PATH
+  [ -f "$f" ] && grep -qxF -- "$1" "$f" && return 0
+  mkdir -p "$(dirname "$f")"
+  printf '%s\n' "$1" >>"$f"
+  g add -- "$SYNCED_PATH" >/dev/null 2>&1
+}
+
+synced_remove() {  # <rel path>: drop the record for it and anything under it
+  local f=$ROOT/$SYNCED_PATH
+  [ -f "$f" ] || return 0
+  awk -v p="$1" '$0 != p && index($0, p "/") != 1' "$f" >"$f.gpm" && mv "$f.gpm" "$f"
+  g add -- "$SYNCED_PATH" >/dev/null 2>&1
+}
+
 # --- keep and include -------------------------------------------------------
 
 # Keep a path on this computer only. Commits the change.
@@ -282,6 +320,7 @@ do_keep() {
     problem "a later line in .gitignore still un-ignores $rel: $(g check-ignore -v --no-index -n -- "$rel" | cut -f1)"
   fi
   drop_pending "$rel"
+  synced_remove "$rel"
   commit_index "Keep $rel on this computer only" && step "committed"
   return 0
 }
@@ -349,6 +388,8 @@ do_include() {
   if [ -e "$ROOT/$rel" ]; then
     g add -A -- "$rel" >/dev/null 2>&1
   fi
+  # The answer covers the folder's new data from now on, not only today's.
+  [ -d "$ROOT/$rel" ] && synced_add "$rel"
   drop_pending "$rel"
   commit_index "Sync $rel to GitHub" && step "committed; it goes up with the next sync"
   return 0
@@ -475,7 +516,7 @@ EOF
 # folder (the paper engine's template ignores .claude/*).
 unignore_own_files() {
   local f
-  for f in "$SYNC_PATH" "$CLAUDE_FILE" "$CODEX_FILE"; do
+  for f in "$SYNC_PATH" "$SYNCED_PATH" "$CLAUDE_FILE" "$CODEX_FILE"; do
     [ -e "$ROOT/$f" ] || continue
     g check-ignore -q --no-index -- "$f" 2>/dev/null || continue
     block_add "$OWN_BEGIN" "!/$f"
@@ -570,9 +611,16 @@ legacy_line_blocked() {  # <pattern>
     done
 }
 
+# Every new file a legacy line keeps off now, one per line.
+legacy_line_files() {  # <pattern>
+  (cd "$ROOT" && MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+    git -c core.quotePath=false ls-files --others --ignored --exclude="$1" 2>/dev/null)
+}
+
 take_over_legacy() {  # uses LEGACY_KEEP / LEGACY_SYNC arrays of lines
-  local l blocked
+  local l blocked freed
   local -a keep_lines=() notes=()
+  freed=$(mktemp) || freed=/dev/null
   for l in "${LEGACY_KEEP[@]+"${LEGACY_KEEP[@]}"}"; do
     keep_lines+=("$l")
     notes+=("kept $l on this computer (the user's answer)")
@@ -585,6 +633,9 @@ take_over_legacy() {  # uses LEGACY_KEEP / LEGACY_SYNC arrays of lines
       keep_lines+=("$l")
       notes+=("kept $l anyway: it keeps a file over $LIMIT_MB MB off GitHub, which GitHub would refuse ($(printf '%s' "$blocked" | head -1))")
     else
+      # Staged now: the user answered for these files, so the sync must not
+      # hold them back as new data.
+      legacy_line_files "$l" >>"$freed"
       notes+=("$l will sync to GitHub (the user's answer)")
     fi
   done
@@ -592,6 +643,12 @@ take_over_legacy() {  # uses LEGACY_KEEP / LEGACY_SYNC arrays of lines
   # and the removal must not find it there.
   remove_legacy_ignore
   step "removed the old sync's lines from .gitignore"
+  if [ -s "$freed" ]; then
+    (cd "$ROOT" && git -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null |
+      awk 'NR == FNR { f[$0] = 1; next } ($0 in f)' "$freed" - |
+      tr '\n' '\0' | xargs -0 git add -- >/dev/null 2>&1)
+  fi
+  [ "$freed" != /dev/null ] && rm -f "$freed"
   for l in "${keep_lines[@]+"${keep_lines[@]}"}"; do block_add "$BLOCK_BEGIN" "$l"; done
   for l in "${notes[@]+"${notes[@]}"}"; do step "$l"; done
 
@@ -622,6 +679,10 @@ slug() {
   echo "${s:-project}"
 }
 
+shown_path() {  # a folder as "data/", a file as itself
+  if [ -d "$ROOT/$1" ]; then printf '%s/' "$1"; else printf '%s' "$1"; fi
+}
+
 interactive() { [ -t 0 ] && [ -t 1 ] && [ "${NO_INPUT:-0}" != 1 ]; }
 
 ask() {  # <prompt> ; answer on stdout
@@ -646,7 +707,7 @@ cloud_folder() {
 
 cmd_connect() {
   local path="" owner="" repo="" url="" public=0 context="" clis="claude,codex"
-  local allow_cloud=0
+  local allow_cloud=0 keep_all_data=0
   local -a suggest=() keep=() sync=()
   LEGACY_KEEP=(); LEGACY_SYNC=()
   while [ $# -gt 0 ]; do
@@ -659,6 +720,7 @@ cmd_connect() {
       --context) context=$2; shift ;;
       --keep) keep+=("$2"); shift ;;
       --sync) sync+=("$2"); shift ;;
+      --keep-all-data) keep_all_data=1 ;;
       --cli) clis=$2; shift ;;
       --allow-cloud-folder) allow_cloud=1 ;;
       --no-input) NO_INPUT=1 ;;
@@ -745,12 +807,25 @@ then re-run this command."
     q_path+=("$r"); q_why+=("suggested"); q_size+=("$(bytes_under "$r")")
     answered+=("$r")
   done
-  local size dir
+  local size dir count
   while IFS=$'\t' read -r size dir; do
     [ -n "$dir" ] || continue
     is_answered "$dir" && continue
     q_path+=("$dir"); q_why+=("large"); q_size+=("$size")
+    answered+=("$dir")
   done < <(large_folders)
+  # Data of any size is asked about: nothing of it goes up unless the user
+  # says so.
+  while IFS=$'\t' read -r count dir; do
+    [ -n "$dir" ] || continue
+    is_answered "$dir" && continue
+    q_path+=("$dir"); q_size+=("$(bytes_under "$dir")")
+    if [ "$count" = 1 ]; then q_why+=("1 data file"); else q_why+=("$count data files"); fi
+  done < <(data_places)
+  if [ "$keep_all_data" = 1 ]; then
+    keep_rel+=("${q_path[@]+"${q_path[@]}"}")
+    q_path=(); q_why=(); q_size=()
+  fi
   local -a q_legacy=()
   if [ -n "$legacy_lines" ]; then
     while IFS= read -r l; do
@@ -771,10 +846,21 @@ then re-run this command."
         repo=${a:-$proposed}
       fi
       local i
-      for i in "${!q_path[@]}"; do
-        a=$(ask "${q_path[i]}/ holds $(human "${q_size[i]}"). Keep it on this computer (recommended), or sync it to GitHub? [keep/sync]:")
-        case $a in s|sync|S|Sync) sync_rel+=("${q_path[i]}") ;; *) keep_rel+=("${q_path[i]}") ;; esac
-      done
+      if [ "${#q_path[@]}" -gt 0 ]; then
+        echo "This project holds data:" >/dev/tty
+        for i in "${!q_path[@]}"; do
+          echo "  $(shown_path "${q_path[i]}") ($(human "${q_size[i]}"))" >/dev/tty
+        done
+        a=$(ask "Should any of it go to GitHub? Nothing is uploaded unless you say so. [no/yes]:")
+        case $a in
+          y|yes|Y|Yes)
+            for i in "${!q_path[@]}"; do
+              a=$(ask "$(shown_path "${q_path[i]}") holds $(human "${q_size[i]}"). Keep it on this computer (recommended), or sync it to GitHub? [keep/sync]:")
+              case $a in s|sync|S|Sync) sync_rel+=("${q_path[i]}") ;; *) keep_rel+=("${q_path[i]}") ;; esac
+            done ;;
+          *) keep_rel+=("${q_path[@]}") ;;
+        esac
+      fi
       for i in "${!q_legacy[@]}"; do
         a=$(ask "The old sync kept ${q_legacy[i]} off GitHub. Keep it that way? [keep/sync]:")
         case $a in s|sync|S|Sync) LEGACY_SYNC+=("${q_legacy[i]}") ;; *) LEGACY_KEEP+=("${q_legacy[i]}") ;; esac
@@ -788,9 +874,15 @@ then re-run this command."
       local i
       for i in "${!q_path[@]}"; do
         local why="holds $(human "${q_size[i]}")"
-        [ "${q_why[i]}" = suggested ] && why="$why; the caller says data lives here"
-        echo "data: ${q_path[i]}/ ($why) - re-run with --keep ${q_path[i]} or --sync ${q_path[i]}"
+        case ${q_why[i]} in
+          suggested) why="$why; the caller says data lives here" ;;
+          large) ;;
+          *) why="$why; ${q_why[i]}" ;;
+        esac
+        echo "data: $(shown_path "${q_path[i]}") ($why) - re-run with --keep ${q_path[i]} or --sync ${q_path[i]}"
       done
+      [ "${#q_path[@]}" -gt 0 ] &&
+        echo "Nothing of this data goes to GitHub unless the user says so. If they want none of it there, re-run with --keep-all-data."
       for i in "${!q_legacy[@]}"; do
         echo "old: ${q_legacy[i]} (the paper engine's old sync kept this off GitHub without asking) - re-run with --keep '${q_legacy[i]}' or --sync '${q_legacy[i]}'"
       done
@@ -808,11 +900,15 @@ then re-run this command."
   done
   for r in "${sync_rel[@]+"${sync_rel[@]}"}"; do
     local big
+    [ -d "$ROOT/$r" ] && synced_add "$r"
     big=$(over_limit "$r")
     [ -n "$big" ] && step "$r will sync, except the files over $LIMIT_MB MB in it, which GitHub refuses; they will be asked about one by one: $(printf '%s' "$big" | head -3 | tr '\n' ' ')"
     if [ -n "$(ignoring_rule "$r")" ]; then
       do_include "$r" 0 >/dev/null || step "$r is ignored by a rule gpm did not write; run \`gpm include $r\` to change that"
     fi
+    # A file has no folder to record, so the answer is staged now, or the
+    # sync would hold it back as new data.
+    [ -f "$ROOT/$r" ] && [ -z "$big" ] && g add -- "$r" >/dev/null 2>&1
   done
   [ "$legacy" = 1 ] && take_over_legacy
 
@@ -891,7 +987,7 @@ cmd_run() {
 cmd_pending() {
   require_connected "${1:-.}"
   local list
-  list=$(cd "$ROOT" && . "$LIB/sync.sh" && too_large)
+  list=$(cd "$ROOT" && . "$LIB/sync.sh" && held_back)
   if [ -z "$list" ]; then
     echo "Nothing is waiting for an answer."
     return 0
@@ -942,7 +1038,7 @@ cmd_status() {
   local ahead
   ahead=$(g rev-list --count '@{u}..HEAD' 2>/dev/null) && [ "$ahead" != 0 ] &&
     echo "Unpushed:  $ahead commit(s), which go up with the next sync"
-  pend=$(cd "$ROOT" && . "$LIB/sync.sh" && too_large | wc -l | tr -d ' ')
+  pend=$(cd "$ROOT" && . "$LIB/sync.sh" && held_back | wc -l | tr -d ' ')
   echo "Pending:   ${pend:-0} path(s) waiting for an answer (gpm pending)"
   echo "Kept on this computer:"
   local kept
@@ -1023,14 +1119,15 @@ gpm $VERSION - keep a project folder on GitHub from any AI CLI
 
   gpm connect <folder> [--repo NAME] [--owner ORG] [--url URL] [--public]
               [--suggest-data PATH]... [--context SENTENCE]
-              [--keep PATH]... [--sync PATH]... [--cli claude,codex,agents]
-              [--allow-cloud-folder] [--no-input]
+              [--keep PATH]... [--sync PATH]... [--keep-all-data]
+              [--cli claude,codex,agents] [--allow-cloud-folder] [--no-input]
       Make the folder a private GitHub repository and keep it in step.
       Without --repo it proposes a name and stops; without an answer for
-      each data folder it asks and stops. Exit 3 means "needs answers".
+      each place data sits it asks and stops. Exit 3 means "needs answers".
+      --keep-all-data answers "keep it on this computer" for every one.
   gpm sync start|end|push|report    what the hooks run
   gpm run <cli> [args...]           sync, run the CLI, sync (no time limit)
-  gpm pending                       new, large files held back for an answer
+  gpm pending                       new data and large files held back for an answer
   gpm keep <path>                   keep it on this computer only
   gpm include <path> [--yes]        put it on GitHub (the un-ignore)
   gpm status                        what is connected, synced, kept, pending
