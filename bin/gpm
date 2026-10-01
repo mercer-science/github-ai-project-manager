@@ -12,7 +12,7 @@
 
 set -u
 
-VERSION=2026.9.30
+VERSION=2026.10.1
 
 # --- CONTRACT: the markers and strings other files and tests read ---
 BLOCK_BEGIN="# --- github-ai-project-manager: kept on this computer (the user's answers) ---"
