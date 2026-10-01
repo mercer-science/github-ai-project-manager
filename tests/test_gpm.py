@@ -242,6 +242,49 @@ def test_contracts():
                                  for v in ("start", "report", "end")), cmds)
 
 
+def test_release():
+    section("The dated version: one value in two files, and the check")
+    sys.path.insert(0, os.path.join(REPO, "tools"))
+    import release
+    manifest, cli = release.versions(REPO)
+    check("plugin.json and bin/gpm carry the same version",
+          manifest and manifest == cli, (manifest, cli))
+    check("...a date with no leading zeros",
+          all(p.isdigit() and (p == "0" or not p.startswith("0"))
+              for p in manifest.split(".")) and len(manifest.split(".")) == 3,
+          manifest)
+    r = subprocess.run([BASH, GPM, "version"], capture_output=True, text=True)
+    check("gpm version prints it", r.stdout.strip() == f"gpm {manifest}",
+          r.stdout)
+
+    sb = Sandbox()
+    try:
+        repo = sb.path("plugin")
+        for rel in (".claude-plugin/plugin.json", "bin/gpm"):
+            os.makedirs(os.path.dirname(os.path.join(repo, rel)), exist_ok=True)
+            shutil.copy(os.path.join(REPO, *rel.split("/")),
+                        os.path.join(repo, *rel.split("/")))
+        sb.git("init", "-q", "-b", "main", repo)
+        sb.git("-C", repo, "add", "-A")
+        sb.git("-C", repo, "commit", "-q", "-m", "first")
+        write(repo, "lib/sync.sh", "# changed\n")
+        sb.git("-C", repo, "add", "-A")
+        sb.git("-C", repo, "commit", "-q", "-m", "a change that ships")
+        check("check calls a shipped change after the bump stale",
+              release.check(repo)["state"] == "stale", release.check(repo))
+        res = release.bump(repo, "2031.1.2")
+        check("bump writes both files", res["written"]
+              and release.versions(repo) == ("2031.1.2", "2031.1.2"), res)
+        check("...changing only the version line",
+              sb.git("-C", repo, "diff", "--numstat").stdout.split()
+              [:2] == ["1", "1"], sb.git("-C", repo, "diff").stdout)
+        sb.git("-C", repo, "commit", "-q", "-am", "Version 2031.1.2")
+        check("...after which check is current (-G, not -S, finds the bump)",
+              release.check(repo)["state"] == "current", release.check(repo))
+    finally:
+        sb.clean()
+
+
 def test_connect_asks_first():
     section("Connect asks before it creates or commits anything")
     sb = Sandbox()
@@ -839,6 +882,7 @@ def main():
         print("git and bash are required")
         return 1
     test_contracts()
+    test_release()
     test_connect_asks_first()
     test_connect_and_sync()
     test_detached_push_survives_group_kill()

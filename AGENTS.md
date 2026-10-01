@@ -23,6 +23,8 @@ adapters/codex.json       the hooks block for .codex/hooks.json
 skills/github-project/    the one skill: which command answers which sentence
 .claude-plugin/           plugin.json + marketplace.json, read by Claude Code and Codex
 install.sh                puts gpm on PATH, for any other CLI
+tools/release.py          the dated version (bump) and when one is overdue
+                          (check); maintainer tooling, never run by a project
 tests/test_gpm.py         the suite
 ```
 
@@ -88,3 +90,18 @@ python tests/test_gpm.py
 
 It is offline, needs git and bash, and builds everything in a temporary
 folder with its own git identity. CI runs it on Linux, macOS and Windows.
+
+## Releasing
+
+The version is the release date with no leading zeros (`2026.10.1`), the
+same scheme as the paper engine. It lives in `.claude-plugin/plugin.json`,
+which `/plugin update` compares, and in `VERSION=` in `bin/gpm`; the suite
+fails if they differ. Never edit either by hand:
+
+```bash
+python tools/release.py check   # has shipped content moved since the bump?
+python tools/release.py bump    # write today's date into both
+```
+
+`check` reports and never refuses: a commit is not a release. Commit a bump
+on its own as `Version <date>: <what changed>`.
